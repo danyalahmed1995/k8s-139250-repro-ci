@@ -2,6 +2,9 @@ name: Reproduce Kubernetes 139276 Deterministic Collision
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/repro-k8s-139276-deterministic.yml"
 
 jobs:
   repro:
@@ -429,4 +432,5 @@ docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh |
         with:
           name: k8s-139276-deterministic-runtime-repro-logs
           path: artifacts/
+
 
