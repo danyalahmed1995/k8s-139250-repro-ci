@@ -1,0 +1,236 @@
+name: Reproduce Kubernetes 139276
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Show runner environment
+        run: |
+          set -eux
+          uname -a
+          docker version
+
+      - name: Install kind and kubectl
+        run: |
+          set -eux
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+
+          curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+      - name: Create IPVS kind cluster
+        run: |
+          set -eux
+          cat > kind-ipvs.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: k8s-139276-ipvs
+          networking:
+            kubeProxyMode: "ipvs"
+          nodes:
+            - role: control-plane
+          EOF
+
+          kind delete cluster --name k8s-139276-ipvs || true
+          kind create cluster --config kind-ipvs.yaml --image kindest/node:v1.31.0
+
+          kubectl cluster-info
+          kubectl get nodes -o wide
+          kubectl -n kube-system get pods -o wide
+
+      - name: Install node debug tools
+        run: |
+          set -eux
+          docker exec k8s-139276-ipvs-control-plane bash -lc '
+            apt-get update
+            apt-get install -y curl ipvsadm conntrack iptables tcpdump procps iproute2
+          '
+
+      - name: Verify kube-proxy IPVS mode
+        run: |
+          set -eux
+          kubectl -n kube-system get configmap kube-proxy -o yaml | tee kube-proxy-configmap.yaml
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=300 | tee kube-proxy.log || true
+          docker exec k8s-139276-ipvs-control-plane bash -lc "ipvsadm -Ln" | tee ipvs-initial.txt
+
+      - name: Deploy backend
+        run: |
+          set -eux
+          cat > app.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: k8s-139276-echo
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: k8s-139276-echo
+            template:
+              metadata:
+                labels:
+                  app: k8s-139276-echo
+              spec:
+                containers:
+                  - name: agnhost
+                    image: registry.k8s.io/e2e-test-images/agnhost:2.53
+                    args: ["netexec", "--http-port=9397"]
+                    ports:
+                      - containerPort: 9397
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: k8s-139276-clusterip
+          spec:
+            type: ClusterIP
+            selector:
+              app: k8s-139276-echo
+            ports:
+              - name: http
+                port: 9397
+                targetPort: 9397
+          EOF
+
+          kubectl apply -f app.yaml
+          kubectl rollout status deploy/k8s-139276-echo --timeout=180s
+          kubectl get pod -o wide
+          kubectl get svc -o wide
+
+          CLUSTER_IP="$(kubectl get svc k8s-139276-clusterip -o jsonpath='{.spec.clusterIP}')"
+          echo "$CLUSTER_IP" | tee cluster-ip.txt
+
+          docker exec k8s-139276-ipvs-control-plane bash -lc "curl -v --max-time 5 http://$CLUSTER_IP:9397/hostname"
+
+      - name: Create NodePort services
+        run: |
+          set -eux
+          cat > nodeports.yaml <<'EOF'
+          EOF
+
+          for p in $(seq 30000 32767); do
+            cat >> nodeports.yaml <<EOF
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: np-$p
+          spec:
+            type: NodePort
+            selector:
+              app: k8s-139276-echo
+            ports:
+              - name: p$p
+                port: $p
+                targetPort: 9397
+                nodePort: $p
+          EOF
+          done
+
+          kubectl apply -f nodeports.yaml
+          kubectl get svc | tee services-after-nodeports.txt
+          kubectl get svc | grep NodePort | wc -l | tee nodeport-count.txt
+          docker exec k8s-139276-ipvs-control-plane bash -lc "ipvsadm -Ln" | tee ipvs-after-nodeports.txt
+
+      - name: Stress node-host to ClusterIP traffic
+        run: |
+          set -eux
+          CLUSTER_IP="$(cat cluster-ip.txt)"
+          cat > stress.sh <<EOF
+          #!/usr/bin/env bash
+          set -u
+
+          URL="http://$CLUSTER_IP:9397/hostname"
+          echo "URL=\$URL"
+          date
+
+          rm -f /tmp/curl-failures.log /tmp/conntrack-synsent.log
+
+          seq 1 50000 | xargs -n1 -P200 -I{} bash -c '
+            if ! curl -sS --connect-timeout 1 --max-time 2 "$0" >/dev/null; then
+              echo "curl failed iteration={}" >> /tmp/curl-failures.log
+            fi
+          ' "\$URL" || true
+
+          date
+          echo "failure count:"
+          wc -l /tmp/curl-failures.log 2>/dev/null || true
+
+          conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=30[0-9][0-9][0-9]|sport=31[0-9][0-9][0-9]|sport=32[0-7][0-9][0-9]" > /tmp/conntrack-synsent.log || true
+          cat /tmp/conntrack-synsent.log || true
+          EOF
+
+          docker cp stress.sh k8s-139276-ipvs-control-plane:/tmp/stress.sh
+          docker exec k8s-139276-ipvs-control-plane bash -lc "chmod +x /tmp/stress.sh && /tmp/stress.sh" | tee stress-output.txt
+
+          docker cp k8s-139276-ipvs-control-plane:/tmp/curl-failures.log ./curl-failures.log || true
+          docker cp k8s-139276-ipvs-control-plane:/tmp/conntrack-synsent.log ./conntrack-synsent.log || true
+
+      - name: Final state and verdict
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          kubectl get svc -o wide > artifacts/services.txt || true
+          kubectl get endpoints -o wide > artifacts/endpoints.txt || true
+          kubectl get pods -o wide > artifacts/pods.txt || true
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=500 > artifacts/kube-proxy.log || true
+
+          docker exec k8s-139276-ipvs-control-plane bash -lc '
+            set -x
+            ipvsadm -Ln || true
+            iptables-save | grep -E "KUBE|MASQ|random" || true
+            conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=30[0-9][0-9][0-9]|sport=31[0-9][0-9][0-9]|sport=32[0-7][0-9][0-9]" || true
+            sysctl net.ipv4.ip_local_port_range || true
+            sysctl net.ipv4.ip_local_reserved_ports || true
+          ' > artifacts/final-node-state.txt 2>&1 || true
+
+          cp *.txt artifacts/ 2>/dev/null || true
+          cp *.log artifacts/ 2>/dev/null || true
+          cp *.yaml artifacts/ 2>/dev/null || true
+
+          FAILURES="$(wc -l < curl-failures.log 2>/dev/null || echo 0)"
+          CONNTRACK_LINES="$(wc -l < conntrack-synsent.log 2>/dev/null || echo 0)"
+
+          {
+            echo "# Kubernetes #139276 CI Repro Summary"
+            echo
+            echo "Failure count: $FAILURES"
+            echo "Relevant conntrack lines: $CONNTRACK_LINES"
+            echo
+            if [ "$FAILURES" -gt 0 ] && [ "$CONNTRACK_LINES" -gt 0 ]; then
+              echo "Verdict: POSSIBLY REPRODUCED"
+              echo
+              echo "Curl failures occurred and conntrack had SYN_SENT/UNREPLIED or NodePort-range source-port lines. Needs manual review of artifacts before claiming confirmed reproduction."
+            elif [ "$FAILURES" -gt 0 ]; then
+              echo "Verdict: INCONCLUSIVE"
+              echo
+              echo "Curl failures occurred, but conntrack evidence did not clearly show the reported NodePort/source-port collision."
+            else
+              echo "Verdict: NOT REPRODUCED"
+              echo
+              echo "Stress completed without observed curl failures."
+            fi
+          } | tee artifacts/repro-139276-summary.md
+
+          kind export logs artifacts/kind-logs --name k8s-139276-ipvs || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-139276-runtime-repro-logs
+          path: artifacts/
