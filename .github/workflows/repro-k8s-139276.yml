@@ -147,14 +147,15 @@ jobs:
 
       - name: Stress node-host to ClusterIP traffic
         run: |
-          set -eux
+          set -euxo pipefail
           CLUSTER_IP="$(cat cluster-ip.txt)"
-          cat > stress.sh <<EOF
+
+          cat > stress.sh <<'EOF'
           #!/usr/bin/env bash
           set -u
 
-          URL="http://$CLUSTER_IP:9397/hostname"
-          echo "URL=\$URL"
+          URL="http://__CLUSTER_IP__:9397/hostname"
+          echo "URL=$URL"
           date
 
           rm -f /tmp/curl-failures.log /tmp/conntrack-synsent.log
@@ -163,7 +164,7 @@ jobs:
             if ! curl -sS --connect-timeout 1 --max-time 2 "$0" >/dev/null; then
               echo "curl failed iteration={}" >> /tmp/curl-failures.log
             fi
-          ' "\$URL" || true
+          ' "$URL" || true
 
           date
           echo "failure count:"
@@ -173,8 +174,10 @@ jobs:
           cat /tmp/conntrack-synsent.log || true
           EOF
 
-          docker cp stress.sh k8s-139276-ipvs-control-plane:/tmp/stress.sh
-          docker exec k8s-139276-ipvs-control-plane bash -lc "chmod +x /tmp/stress.sh && /tmp/stress.sh" | tee stress-output.txt
+          sed -i "s/__CLUSTER_IP__/$CLUSTER_IP/g" stress.sh
+          chmod +x stress.sh
+
+          docker exec -i k8s-139276-ipvs-control-plane bash -s < stress.sh | tee stress-output.txt
 
           docker cp k8s-139276-ipvs-control-plane:/tmp/curl-failures.log ./curl-failures.log || true
           docker cp k8s-139276-ipvs-control-plane:/tmp/conntrack-synsent.log ./conntrack-synsent.log || true
@@ -234,3 +237,4 @@ jobs:
         with:
           name: k8s-139276-runtime-repro-logs
           path: artifacts/
+
