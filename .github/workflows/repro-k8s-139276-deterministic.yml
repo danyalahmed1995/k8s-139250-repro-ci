@@ -242,10 +242,26 @@ jobs:
           echo "URL=\$URL"
           date
 
+          rm -f /tmp/curl-error-samples.log
+
           seq 1 100000 | xargs -n1 -P300 -I{} bash -c '
-            if ! curl -sS --connect-timeout 1 --max-time 2 "$0" >/dev/null; then
-              echo "curl failed iteration={}" >> /tmp/curl-failures.log
+            iter="{}"
+            err="/tmp/curl-error-$iter.log"
+
+            if ! curl -sS --connect-timeout 1 --max-time 2 "$0" >/dev/null 2>"$err"; then
+              echo "curl failed iteration=$iter" >> /tmp/curl-failures.log
+
+              # Keep only a bounded sample so the artifact stays readable.
+              sample_count="$(grep -c "^--- iteration=" /tmp/curl-error-samples.log 2>/dev/null || echo 0)"
+              if [ "$sample_count" -lt 100 ]; then
+                {
+                  echo "--- iteration=$iter ---"
+                  cat "$err"
+                } >> /tmp/curl-error-samples.log
+              fi
             fi
+
+            rm -f "$err"
           ' "\$URL" || true
 
           date
@@ -259,6 +275,7 @@ jobs:
           docker exec -i k8s-139276-deterministic-control-plane bash -s < stress.sh | tee stress-overlap-output.txt
 
           docker cp k8s-139276-deterministic-control-plane:/tmp/curl-failures.log ./curl-failures.log || true
+          docker cp k8s-139276-deterministic-control-plane:/tmp/curl-error-samples.log ./curl-error-samples.log || true
           docker cp k8s-139276-deterministic-control-plane:/tmp/conntrack-overlap.log ./conntrack-overlap.log || true
 
       - name: Final state and verdict
@@ -319,4 +336,5 @@ jobs:
         with:
           name: k8s-139276-deterministic-runtime-repro-logs
           path: artifacts/
+
 
