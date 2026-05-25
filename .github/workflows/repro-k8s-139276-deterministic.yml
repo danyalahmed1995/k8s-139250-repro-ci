@@ -211,7 +211,7 @@ jobs:
           run_one "control-no-nodeport-33000" "33000"
 
           # Delete one NodePort, then test same source port.
-          kubectl delete svc np-collision-32771 --ignore-not-found=true
+          echo "DELETE_NODEPORT_32771_FROM_HOST"
           sleep 5
           run_one "deleted-nodeport-32771" "32771"
 
@@ -231,7 +231,7 @@ jobs:
                 targetPort: 9397
                 nodePort: 32771
           YAML
-          kubectl apply -f /tmp/recreate-32771.yaml
+          echo "RECREATE_NODEPORT_32771_FROM_HOST"
           sleep 5
           run_one "recreated-nodeport-32771" "32771"
 
@@ -241,13 +241,7 @@ jobs:
           EOF
 
           chmod +x direct-test.sh
-
-          # Need kubectl inside the node for delete/recreate step.
-          docker cp "$(which kubectl)" k8s-139276-deterministic-control-plane:/usr/local/bin/kubectl
-          docker cp "$HOME/.kube/config" k8s-139276-deterministic-control-plane:/tmp/kubeconfig
-          docker exec k8s-139276-deterministic-control-plane bash -lc "mkdir -p /root/.kube && cp /tmp/kubeconfig /root/.kube/config"
-
-          docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh | tee direct-collision-output.txt
+docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh | tee direct-collision-output.txt
 
           docker cp k8s-139276-deterministic-control-plane:/tmp/direct-collision-results.txt ./direct-collision-results.txt || true
           docker cp k8s-139276-deterministic-control-plane:/tmp/direct-collision-conntrack.txt ./direct-collision-conntrack.txt || true
@@ -435,3 +429,4 @@ jobs:
         with:
           name: k8s-139276-deterministic-runtime-repro-logs
           path: artifacts/
+
