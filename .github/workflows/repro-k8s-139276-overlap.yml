@@ -1,0 +1,265 @@
+name: Reproduce Kubernetes 139276 Overlap Range
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Show runner environment
+        run: |
+          set -euxo pipefail
+          uname -a
+          docker version
+
+      - name: Install kind and kubectl
+        run: |
+          set -euxo pipefail
+
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+
+          curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+      - name: Create IPVS kind cluster with expanded NodePort range
+        run: |
+          set -euxo pipefail
+
+          cat > kind-ipvs-overlap.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: k8s-139276-overlap
+          networking:
+            kubeProxyMode: "ipvs"
+          kubeadmConfigPatches:
+            - |
+              kind: ClusterConfiguration
+              apiServer:
+                extraArgs:
+                  service-node-port-range: "30000-60999"
+          nodes:
+            - role: control-plane
+          EOF
+
+          kind delete cluster --name k8s-139276-overlap || true
+          kind create cluster --config kind-ipvs-overlap.yaml --image kindest/node:v1.31.0
+
+          kubectl cluster-info
+          kubectl get nodes -o wide
+          kubectl -n kube-system get pods -o wide
+
+      - name: Install node debug tools
+        run: |
+          set -euxo pipefail
+          docker exec k8s-139276-overlap-control-plane bash -lc '
+            apt-get update
+            apt-get install -y curl ipvsadm conntrack iptables tcpdump procps iproute2
+          '
+
+      - name: Verify IPVS and ranges
+        run: |
+          set -euxo pipefail
+
+          kubectl -n kube-system get configmap kube-proxy -o yaml | tee kube-proxy-configmap.yaml
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=300 | tee kube-proxy.log || true
+
+          docker exec k8s-139276-overlap-control-plane bash -lc '
+            set -x
+            ipvsadm -Ln || true
+            sysctl net.ipv4.ip_local_port_range || true
+            sysctl net.ipv4.ip_local_reserved_ports || true
+            ps aux | grep kube-apiserver | grep service-node-port-range || true
+          ' | tee baseline-node.txt
+
+      - name: Deploy backend
+        run: |
+          set -euxo pipefail
+
+          cat > app.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: k8s-139276-echo
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: k8s-139276-echo
+            template:
+              metadata:
+                labels:
+                  app: k8s-139276-echo
+              spec:
+                containers:
+                  - name: agnhost
+                    image: registry.k8s.io/e2e-test-images/agnhost:2.53
+                    args: ["netexec", "--http-port=9397"]
+                    ports:
+                      - containerPort: 9397
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: k8s-139276-clusterip
+          spec:
+            type: ClusterIP
+            selector:
+              app: k8s-139276-echo
+            ports:
+              - name: http
+                port: 9397
+                targetPort: 9397
+          EOF
+
+          kubectl apply -f app.yaml
+          kubectl rollout status deploy/k8s-139276-echo --timeout=180s
+          kubectl get pod -o wide
+          kubectl get svc -o wide
+
+          CLUSTER_IP="$(kubectl get svc k8s-139276-clusterip -o jsonpath='{.spec.clusterIP}')"
+          echo "$CLUSTER_IP" | tee cluster-ip.txt
+
+          docker exec k8s-139276-overlap-control-plane bash -lc "curl -v --max-time 5 http://$CLUSTER_IP:9397/hostname"
+
+      - name: Create overlapping NodePort services
+        run: |
+          set -euxo pipefail
+
+          cat > overlap-nodeports.yaml <<'EOF'
+          EOF
+
+          for p in $(seq 32768 32999); do
+            cat >> overlap-nodeports.yaml <<EOF
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: np-overlap-$p
+          spec:
+            type: NodePort
+            selector:
+              app: k8s-139276-echo
+            ports:
+              - name: p$p
+                port: $p
+                targetPort: 9397
+                nodePort: $p
+          EOF
+          done
+
+          kubectl apply -f overlap-nodeports.yaml
+          kubectl get svc | tee services-after-overlap-nodeports.txt
+          kubectl get svc | grep NodePort | wc -l | tee nodeport-count.txt
+          docker exec k8s-139276-overlap-control-plane bash -lc "ipvsadm -Ln" | tee ipvs-after-overlap-nodeports.txt
+
+      - name: Stress node-host to ClusterIP traffic
+        run: |
+          set -euxo pipefail
+
+          CLUSTER_IP="$(cat cluster-ip.txt)"
+
+          cat > stress.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+
+          URL="http://__CLUSTER_IP__:9397/hostname"
+          echo "URL=$URL"
+          date
+
+          rm -f /tmp/curl-failures.log /tmp/conntrack-synsent.log
+
+          seq 1 100000 | xargs -n1 -P300 -I{} bash -c '
+            if ! curl -sS --connect-timeout 1 --max-time 2 "$0" >/dev/null; then
+              echo "curl failed iteration={}" >> /tmp/curl-failures.log
+            fi
+          ' "$URL" || true
+
+          date
+          echo "failure count:"
+          wc -l /tmp/curl-failures.log 2>/dev/null || true
+
+          conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=3276[8-9]|sport=327[7-9][0-9]|sport=328[0-9][0-9]|sport=329[0-9][0-9]" > /tmp/conntrack-synsent.log || true
+
+          echo "relevant conntrack:"
+          cat /tmp/conntrack-synsent.log || true
+          EOF
+
+          sed -i "s/__CLUSTER_IP__/$CLUSTER_IP/g" stress.sh
+          chmod +x stress.sh
+
+          docker exec -i k8s-139276-overlap-control-plane bash -s < stress.sh | tee stress-output.txt
+
+          docker cp k8s-139276-overlap-control-plane:/tmp/curl-failures.log ./curl-failures.log || true
+          docker cp k8s-139276-overlap-control-plane:/tmp/conntrack-synsent.log ./conntrack-synsent.log || true
+
+      - name: Final state and verdict
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          kubectl get svc -o wide > artifacts/services.txt || true
+          kubectl get endpoints -o wide > artifacts/endpoints.txt || true
+          kubectl get pods -o wide > artifacts/pods.txt || true
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=500 > artifacts/kube-proxy.log || true
+
+          docker exec k8s-139276-overlap-control-plane bash -lc '
+            set -x
+            ipvsadm -Ln || true
+            iptables-save | grep -E "KUBE|MASQ|random" || true
+            conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=3276[8-9]|sport=327[7-9][0-9]|sport=328[0-9][0-9]|sport=329[0-9][0-9]" || true
+            sysctl net.ipv4.ip_local_port_range || true
+            sysctl net.ipv4.ip_local_reserved_ports || true
+            ps aux | grep kube-apiserver | grep service-node-port-range || true
+          ' > artifacts/final-node-state.txt 2>&1 || true
+
+          cp *.txt artifacts/ 2>/dev/null || true
+          cp *.log artifacts/ 2>/dev/null || true
+          cp *.yaml artifacts/ 2>/dev/null || true
+
+          FAILURES="$(wc -l < curl-failures.log 2>/dev/null || echo 0)"
+          CONNTRACK_LINES="$(wc -l < conntrack-synsent.log 2>/dev/null || echo 0)"
+          NODEPORT_COUNT="$(cat nodeport-count.txt 2>/dev/null || echo unknown)"
+
+          {
+            echo "# Kubernetes #139276 Overlap Range CI Repro Summary"
+            echo
+            echo "Configured service-node-port-range: 30000-60999"
+            echo "Allocated overlapping NodePorts: 32768-32999"
+            echo "NodePort count: $NODEPORT_COUNT"
+            echo "Failure count: $FAILURES"
+            echo "Relevant conntrack lines: $CONNTRACK_LINES"
+            echo
+            if [ "$FAILURES" -gt 0 ] && [ "$CONNTRACK_LINES" -gt 0 ]; then
+              echo "Verdict: POSSIBLY REPRODUCED"
+              echo
+              echo "Curl failures occurred and conntrack had relevant SYN_SENT/UNREPLIED or overlap-range source-port lines. Review artifacts before claiming confirmed reproduction."
+            elif [ "$FAILURES" -gt 0 ]; then
+              echo "Verdict: INCONCLUSIVE"
+              echo
+              echo "Curl failures occurred, but conntrack evidence did not clearly show the reported collision."
+            else
+              echo "Verdict: NOT REPRODUCED"
+              echo
+              echo "Stress completed without observed curl failures, even with NodePorts overlapping the observed ephemeral source-port range."
+            fi
+          } | tee artifacts/repro-139276-overlap-summary.md
+
+          kind export logs artifacts/kind-logs --name k8s-139276-overlap || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-139276-overlap-runtime-repro-logs
+          path: artifacts/
