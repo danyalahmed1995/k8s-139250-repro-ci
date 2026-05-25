@@ -200,6 +200,10 @@ jobs:
           EOF
 
           for p in $(seq 32768 32999); do
+            if [ "$p" = "32770" ] || [ "$p" = "32771" ]; then
+              continue
+            fi
+
             cat >> overlap-nodeports.yaml <<EOF
           ---
           apiVersion: v1
@@ -315,3 +319,4 @@ jobs:
         with:
           name: k8s-139276-deterministic-runtime-repro-logs
           path: artifacts/
+
