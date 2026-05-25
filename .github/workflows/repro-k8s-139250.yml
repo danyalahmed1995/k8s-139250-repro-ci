@@ -1,0 +1,63 @@
+name: Reproduce Kubernetes 139250
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Show runner environment
+        run: |
+          uname -a
+          docker version
+
+      - name: Install kind
+        run: |
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+      - name: Clone reproducer
+        run: |
+          git clone https://github.com/mjudeikis/k8s-cacher-repro.git
+          cd k8s-cacher-repro
+          git log -1 --oneline
+          ls -la
+
+      - name: Run reproducer
+        run: |
+          cd k8s-cacher-repro
+          chmod +x ./repro.sh
+          bash -euxo pipefail ./repro.sh 2>&1 | tee ../repro-runtime-full.log
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cp repro-runtime-full.log artifacts/ 2>/dev/null || true
+          find k8s-cacher-repro -maxdepth 4 -type f \( -name "*.log" -o -name "*.md" -o -name "*.txt" \) -print -exec cp --parents {} artifacts/ \; || true
+          kind get clusters || true
+          for c in $(kind get clusters 2>/dev/null || true); do
+            kind export logs "artifacts/kind-logs-$c" --name "$c" || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-139250-runtime-repro-logs
+          path: artifacts/
