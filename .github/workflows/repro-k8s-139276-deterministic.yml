@@ -1,6 +1,6 @@
 name: Reproduce Kubernetes 139276 Deterministic Collision
 
-on:
+"on":
   workflow_dispatch:
   push:
     paths:
@@ -24,7 +24,6 @@ jobs:
       - name: Install kind and kubectl
         run: |
           set -euxo pipefail
-
           curl -Lo kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
           chmod +x kind
           sudo mv kind /usr/local/bin/kind
@@ -70,22 +69,7 @@ jobs:
             apt-get install -y curl ipvsadm conntrack iptables tcpdump procps iproute2
           '
 
-      - name: Verify IPVS and node ranges
-        run: |
-          set -euxo pipefail
-
-          kubectl -n kube-system get configmap kube-proxy -o yaml | tee kube-proxy-configmap.yaml
-          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=300 | tee kube-proxy.log || true
-
-          docker exec k8s-139276-deterministic-control-plane bash -lc '
-            set -x
-            ipvsadm -Ln || true
-            sysctl net.ipv4.ip_local_port_range || true
-            sysctl net.ipv4.ip_local_reserved_ports || true
-            ps aux | grep kube-apiserver | grep service-node-port-range || true
-          ' | tee baseline-node.txt
-
-      - name: Deploy backend and deterministic NodePorts
+      - name: Deploy backend and NodePorts
         run: |
           set -euxo pipefail
 
@@ -159,95 +143,52 @@ jobs:
           CLUSTER_IP="$(kubectl get svc k8s-139276-clusterip -o jsonpath='{.spec.clusterIP}')"
           echo "$CLUSTER_IP" | tee cluster-ip.txt
 
-          kubectl get pod -o wide
+          kubectl get pods -o wide
           kubectl get svc -o wide | tee services-initial.txt
 
           docker exec k8s-139276-deterministic-control-plane bash -lc "curl -v --max-time 5 http://$CLUSTER_IP:9397/hostname"
-          docker exec k8s-139276-deterministic-control-plane bash -lc "ipvsadm -Ln" | tee ipvs-initial-services.txt
+          docker exec k8s-139276-deterministic-control-plane bash -lc "ipvsadm -Ln" | tee ipvs-initial.txt
 
-      - name: Deterministic local source-port collision test
+      - name: Direct source-port collision test
         run: |
           set -euxo pipefail
 
           CLUSTER_IP="$(cat cluster-ip.txt)"
 
-          cat > direct-test.sh <<EOF
-          #!/usr/bin/env bash
-          set -u
+          run_curl() {
+            label="$1"
+            port="$2"
 
-          URL="http://$CLUSTER_IP:9397/hostname"
-          OUT="/tmp/direct-collision-results.txt"
-          CT="/tmp/direct-collision-conntrack.txt"
-
-          rm -f "\$OUT" "\$CT"
-
-          run_one() {
-            label="\$1"
-            port="\$2"
-
-            echo "=== \$label local-port=\$port ===" | tee -a "\$OUT"
-            date | tee -a "\$OUT"
+            echo "=== $label local-port=$port ===" | tee -a direct-collision-results.txt
 
             set +e
-            curl -sS --local-port "\$port" --connect-timeout 3 --max-time 6 "\$URL" >"/tmp/\$label.out" 2>"/tmp/\$label.err"
-            rc=\$?
+            docker exec k8s-139276-deterministic-control-plane bash -lc "curl -sS --local-port $port --connect-timeout 3 --max-time 6 http://$CLUSTER_IP:9397/hostname" \
+              > "curl-$label.out" 2> "curl-$label.err"
+            rc=$?
             set -e
 
-            echo "rc=\$rc" | tee -a "\$OUT"
-            echo "stdout:" | tee -a "\$OUT"
-            cat "/tmp/\$label.out" | tee -a "\$OUT" || true
-            echo "stderr:" | tee -a "\$OUT"
-            cat "/tmp/\$label.err" | tee -a "\$OUT" || true
+            echo "rc=$rc" | tee -a direct-collision-results.txt
+            echo "stdout:" | tee -a direct-collision-results.txt
+            cat "curl-$label.out" | tee -a direct-collision-results.txt || true
+            echo "stderr:" | tee -a direct-collision-results.txt
+            cat "curl-$label.err" | tee -a direct-collision-results.txt || true
 
-            echo "--- conntrack after \$label ---" | tee -a "\$CT"
-            conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=\$port|dport=\$port" | tee -a "\$CT" || true
+            docker exec k8s-139276-deterministic-control-plane bash -lc "conntrack -L -p tcp 2>/dev/null | grep -E 'SYN_SENT|UNREPLIED|sport=$port|dport=$port' || true" \
+              | tee -a direct-collision-conntrack.txt
 
-            echo "" | tee -a "\$OUT"
             sleep 3
-            return 0
           }
 
-          # Collision candidates: NodePorts exist on 32770 and 32771.
-          run_one "collision-nodeport-32770" "32770"
+          run_curl "collision-nodeport-32770" "32770"
+          run_curl "collision-nodeport-32771-before-delete" "32771"
 
-          # Control: no NodePort allocated on 33000.
-          run_one "control-no-nodeport-33000" "33000"
-
-          # Delete one NodePort, then test same source port.
-          echo "DELETE_NODEPORT_32771_FROM_HOST"
+          kubectl delete svc np-collision-32771
           sleep 5
-          run_one "deleted-nodeport-32771" "32771"
+          run_curl "no-nodeport-32771-after-delete" "32771"
 
-          # Recreate same NodePort, then test again.
-          cat >/tmp/recreate-32771.yaml <<'YAML'
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: np-collision-32771
-          spec:
-            type: NodePort
-            selector:
-              app: k8s-139276-echo
-            ports:
-              - name: p32771
-                port: 32771
-                targetPort: 9397
-                nodePort: 32771
-          YAML
-          echo "RECREATE_NODEPORT_32771_FROM_HOST"
+          kubectl apply -f app.yaml
           sleep 5
-          run_one "recreated-nodeport-32771" "32771"
-
-          cat "\$OUT"
-          echo "=== relevant conntrack ==="
-          cat "\$CT" || true
-          EOF
-
-          chmod +x direct-test.sh
-docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh | tee direct-collision-output.txt
-
-          docker cp k8s-139276-deterministic-control-plane:/tmp/direct-collision-results.txt ./direct-collision-results.txt || true
-          docker cp k8s-139276-deterministic-control-plane:/tmp/direct-collision-conntrack.txt ./direct-collision-conntrack.txt || true
+          run_curl "collision-nodeport-32771-after-recreate" "32771"
 
       - name: Forced ephemeral overlap stress test
         run: |
@@ -286,7 +227,6 @@ docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh |
 
           URL="http://$CLUSTER_IP:9397/hostname"
 
-          echo "Setting local ephemeral range to overlap NodePorts..."
           sysctl -w net.ipv4.ip_local_port_range="32768 60999"
           sysctl -w net.ipv4.ip_local_reserved_ports=""
 
@@ -309,60 +249,13 @@ docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh |
           wc -l /tmp/curl-failures.log 2>/dev/null || true
 
           conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=3276[8-9]|sport=327[7-9][0-9]|sport=328[0-9][0-9]|sport=329[0-9][0-9]" > /tmp/conntrack-overlap.log || true
-
-          echo "relevant conntrack:"
           cat /tmp/conntrack-overlap.log || true
           EOF
-
-          chmod +x stress.sh
 
           docker exec -i k8s-139276-deterministic-control-plane bash -s < stress.sh | tee stress-overlap-output.txt
 
           docker cp k8s-139276-deterministic-control-plane:/tmp/curl-failures.log ./curl-failures.log || true
           docker cp k8s-139276-deterministic-control-plane:/tmp/conntrack-overlap.log ./conntrack-overlap.log || true
-
-      - name: Reserved NodePort mitigation check
-        if: always()
-        run: |
-          set -euxo pipefail
-
-          CLUSTER_IP="$(cat cluster-ip.txt)"
-
-          cat > reserved-test.sh <<EOF
-          #!/usr/bin/env bash
-          set -u
-
-          URL="http://$CLUSTER_IP:9397/hostname"
-
-          echo "Reserving overlap NodePort range from ephemeral allocation..."
-          sysctl -w net.ipv4.ip_local_port_range="32768 60999"
-          sysctl -w net.ipv4.ip_local_reserved_ports="32768-32999"
-
-          sysctl net.ipv4.ip_local_port_range
-          sysctl net.ipv4.ip_local_reserved_ports || true
-
-          rm -f /tmp/curl-failures-reserved.log /tmp/conntrack-reserved.log
-
-          date
-          seq 1 30000 | xargs -n1 -P200 -I{} bash -c '
-            if ! curl -sS --connect-timeout 1 --max-time 2 "$0" >/dev/null; then
-              echo "curl failed iteration={}" >> /tmp/curl-failures-reserved.log
-            fi
-          ' "\$URL" || true
-          date
-
-          echo "reserved failure count:"
-          wc -l /tmp/curl-failures-reserved.log 2>/dev/null || true
-
-          conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=3276[8-9]|sport=327[7-9][0-9]|sport=328[0-9][0-9]|sport=329[0-9][0-9]" > /tmp/conntrack-reserved.log || true
-          cat /tmp/conntrack-reserved.log || true
-          EOF
-
-          chmod +x reserved-test.sh
-          docker exec -i k8s-139276-deterministic-control-plane bash -s < reserved-test.sh | tee reserved-test-output.txt
-
-          docker cp k8s-139276-deterministic-control-plane:/tmp/curl-failures-reserved.log ./curl-failures-reserved.log || true
-          docker cp k8s-139276-deterministic-control-plane:/tmp/conntrack-reserved.log ./conntrack-reserved.log || true
 
       - name: Final state and verdict
         if: always()
@@ -391,36 +284,26 @@ docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh |
           DIRECT_FAILS="$(grep -E "rc=[1-9]" direct-collision-results.txt 2>/dev/null | wc -l || echo 0)"
           STRESS_FAILS="$(wc -l < curl-failures.log 2>/dev/null || echo 0)"
           STRESS_CT="$(wc -l < conntrack-overlap.log 2>/dev/null || echo 0)"
-          RESERVED_FAILS="$(wc -l < curl-failures-reserved.log 2>/dev/null || echo 0)"
-          RESERVED_CT="$(wc -l < conntrack-reserved.log 2>/dev/null || echo 0)"
           NODEPORT_COUNT="$(cat nodeport-count.txt 2>/dev/null || echo unknown)"
 
           {
             echo "# Kubernetes #139276 Deterministic Collision Repro Summary"
             echo
             echo "Configured service-node-port-range: 30000-60999"
-            echo "Direct collision source ports tested: 32770, 32771"
+            echo "Direct source ports tested: 32770, 32771"
             echo "Stress overlap NodePorts: 32768-32999"
             echo "NodePort count: $NODEPORT_COUNT"
             echo
             echo "Direct collision non-zero curl results: $DIRECT_FAILS"
             echo "Overlap stress curl failures: $STRESS_FAILS"
             echo "Overlap stress relevant conntrack lines: $STRESS_CT"
-            echo "Reserved-range curl failures: $RESERVED_FAILS"
-            echo "Reserved-range relevant conntrack lines: $RESERVED_CT"
             echo
             if [ "$DIRECT_FAILS" -gt 0 ] || { [ "$STRESS_FAILS" -gt 0 ] && [ "$STRESS_CT" -gt 0 ]; }; then
               echo "Verdict: POSSIBLY REPRODUCED"
-              echo
-              echo "One or more deterministic/overlap tests failed. Review direct-collision-results.txt, stress-overlap-output.txt, and conntrack logs before claiming confirmed reproduction."
             elif [ "$STRESS_FAILS" -eq 0 ] && [ "$STRESS_CT" -eq 0 ]; then
               echo "Verdict: NOT REPRODUCED"
-              echo
-              echo "No failure observed with deterministic local source-port tests or forced ephemeral/NodePort overlap stress."
             else
               echo "Verdict: INCONCLUSIVE"
-              echo
-              echo "Mixed or incomplete evidence. Review artifacts."
             fi
           } | tee artifacts/repro-139276-deterministic-summary.md
 
@@ -432,5 +315,3 @@ docker exec -i k8s-139276-deterministic-control-plane bash -s < direct-test.sh |
         with:
           name: k8s-139276-deterministic-runtime-repro-logs
           path: artifacts/
-
-
