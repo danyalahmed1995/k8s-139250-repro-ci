@@ -1,0 +1,171 @@
+name: Probe Kubernetes 139276 Cilium Config Matrix
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/probe-k8s-139276-cilium-matrix.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v1194-kpr-true-sock-false
+            cilium_version: "1.19.4"
+            kube_proxy_replacement: "true"
+            socket_lb: "false"
+          - name: v1194-kpr-true-sock-true
+            cilium_version: "1.19.4"
+            kube_proxy_replacement: "true"
+            socket_lb: "true"
+          - name: v1194-kpr-false-sock-false
+            cilium_version: "1.19.4"
+            kube_proxy_replacement: "false"
+            socket_lb: "false"
+          - name: v1183-kpr-true-sock-false
+            cilium_version: "1.18.3"
+            kube_proxy_replacement: "true"
+            socket_lb: "false"
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Show runner environment
+        run: |
+          set -euxo pipefail
+          uname -a
+          docker version
+
+      - name: Install kind kubectl helm
+        run: |
+          set -euxo pipefail
+
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+
+          curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Create kind cluster
+        run: |
+          set -euxo pipefail
+
+          CLUSTER="k8s-139276-${{ matrix.name }}"
+          echo "$CLUSTER" > cluster-name.txt
+
+          cat > kind.yaml <<EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: $CLUSTER
+          networking:
+            disableDefaultCNI: true
+            kubeProxyMode: "ipvs"
+          kubeadmConfigPatches:
+            - |
+              kind: ClusterConfiguration
+              apiServer:
+                extraArgs:
+                  service-node-port-range: "30000-60999"
+          nodes:
+            - role: control-plane
+          EOF
+
+          kind create cluster --config kind.yaml --image kindest/node:v1.31.0
+          kubectl get nodes -o wide
+          kubectl -n kube-system get pods -o wide || true
+
+      - name: Install Cilium variant
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+
+          helm repo add cilium https://helm.cilium.io/
+          helm repo update
+
+          helm upgrade --install cilium cilium/cilium \
+            --version "${{ matrix.cilium_version }}" \
+            --namespace kube-system \
+            --set kubeProxyReplacement="${{ matrix.kube_proxy_replacement }}" \
+            --set nodePort.enabled=true \
+            --set socketLB.enabled="${{ matrix.socket_lb }}" \
+            --set externalIPs.enabled=true \
+            --set hostPort.enabled=true \
+            --set ipam.mode=kubernetes \
+            --set operator.replicas=1 \
+            --set image.pullPolicy=IfNotPresent
+
+          kubectl -n kube-system rollout status ds/cilium --timeout=360s
+          kubectl -n kube-system rollout status deploy/cilium-operator --timeout=360s
+          kubectl -n kube-system rollout status deploy/coredns --timeout=360s
+
+      - name: Collect Cilium status
+        if: always()
+        run: |
+          set +e
+          mkdir -p artifacts
+
+          echo "${{ matrix.name }}" > artifacts/variant.txt
+          echo "cilium_version=${{ matrix.cilium_version }}" >> artifacts/variant.txt
+          echo "kubeProxyReplacement=${{ matrix.kube_proxy_replacement }}" >> artifacts/variant.txt
+          echo "socketLB.enabled=${{ matrix.socket_lb }}" >> artifacts/variant.txt
+
+          helm -n kube-system get values cilium > artifacts/cilium-helm-values.txt 2>&1
+          kubectl -n kube-system get pods -o wide > artifacts/kube-system-pods.txt 2>&1
+          kubectl -n kube-system logs ds/cilium --tail=800 > artifacts/cilium.log 2>&1
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=500 > artifacts/kube-proxy.log 2>&1
+
+          kubectl -n kube-system exec ds/cilium -- cilium status --verbose > artifacts/cilium-status.txt 2>&1
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg status --verbose > artifacts/cilium-dbg-status.txt 2>&1
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg service list > artifacts/cilium-service-list.txt 2>&1
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg bpf lb list > artifacts/cilium-bpf-lb-list.txt 2>&1
+
+          CLUSTER="$(cat cluster-name.txt)"
+          docker exec "$CLUSTER-control-plane" bash -lc '
+            set -x
+            ipvsadm -Ln || true
+            iptables-save | grep -E "KUBE|CILIUM|MASQ|random" || true
+            sysctl net.ipv4.ip_local_port_range || true
+            sysctl net.ipv4.ip_local_reserved_ports || true
+            bpftool cgroup tree || true
+            bpftool prog show || true
+            bpftool map show || true
+          ' > artifacts/node-state.txt 2>&1
+
+          {
+            echo "# Cilium config probe: ${{ matrix.name }}"
+            echo
+            echo "- Cilium version: ${{ matrix.cilium_version }}"
+            echo "- kubeProxyReplacement: ${{ matrix.kube_proxy_replacement }}"
+            echo "- socketLB.enabled: ${{ matrix.socket_lb }}"
+            echo
+            echo "## Status highlights"
+            grep -Ei "KubeProxyReplacement|Socket LB|NodePort|Services" artifacts/cilium-status.txt artifacts/cilium-dbg-status.txt || true
+            echo
+            if grep -Eiq "NodePort:[[:space:]]+Enabled|NodePort[[:space:]]+Enabled" artifacts/cilium-status.txt artifacts/cilium-dbg-status.txt; then
+              echo "Verdict: NODEPORT_ACTIVE"
+            elif grep -Eiq "NodePort:[[:space:]]+Disabled|NodePort[[:space:]]+Disabled" artifacts/cilium-status.txt artifacts/cilium-dbg-status.txt; then
+              echo "Verdict: NODEPORT_DISABLED"
+            else
+              echo "Verdict: UNKNOWN"
+            fi
+          } | tee artifacts/probe-summary.md
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cilium-config-probe-${{ matrix.name }}
+          path: artifacts/
