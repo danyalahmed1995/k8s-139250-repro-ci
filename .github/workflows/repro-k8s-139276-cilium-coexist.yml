@@ -1,4 +1,4 @@
-name: Reproduce Kubernetes 139276 Cilium Coexist
+name: Reproduce Kubernetes 139276 Cilium NodePort Active
 
 "on":
   workflow_dispatch:
@@ -76,7 +76,7 @@ jobs:
           helm upgrade --install cilium cilium/cilium \
             --version 1.19.4 \
             --namespace kube-system \
-            --set kubeProxyReplacement=false \
+            --set kubeProxyReplacement=true \
             --set nodePort.enabled=true \
             --set socketLB.enabled=false \
             --set externalIPs.enabled=true \
@@ -124,6 +124,14 @@ jobs:
             bpftool prog show || true
             bpftool map show || true
           ' > artifacts/baseline-node-state.txt 2>&1 || true
+
+          echo "Validating Cilium NodePort is active..."
+          if grep -Ei "NodePort:[[:space:]]+Disabled|NodePort[[:space:]]+Disabled" artifacts/cilium-dbg-status.txt artifacts/cilium-status.txt; then
+            echo "Cilium NodePort is still disabled. This run does not match the reported setup."
+            exit 1
+          fi
+
+          grep -Ei "KubeProxyReplacement|Socket LB|NodePort|Services" artifacts/cilium-dbg-status.txt artifacts/cilium-status.txt || true
 
       - name: Deploy backend and overlapping NodePorts
         run: |
@@ -349,7 +357,7 @@ jobs:
             echo "- kind v1.31.0"
             echo "- kube-proxy mode: IPVS"
             echo "- Cilium installed as CNI"
-            echo "- Cilium kubeProxyReplacement=false"
+            echo "- Cilium kubeProxyReplacement=true"
             echo "- Cilium nodePort.enabled=true"
             echo "- Cilium socketLB.enabled=false"
             echo "- service-node-port-range=30000-60999"
@@ -380,3 +388,4 @@ jobs:
         with:
           name: k8s-139276-cilium-coexist-runtime-repro-logs
           path: artifacts/
+
