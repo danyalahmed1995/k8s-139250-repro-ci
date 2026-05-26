@@ -1,0 +1,382 @@
+name: Reproduce Kubernetes 139276 Cilium Coexist
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/repro-k8s-139276-cilium-coexist.yml"
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Show runner environment
+        run: |
+          set -euxo pipefail
+          uname -a
+          docker version
+
+      - name: Install kind kubectl helm
+        run: |
+          set -euxo pipefail
+
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+          kind version
+
+          curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+      - name: Create kind cluster with kube-proxy IPVS and Cilium CNI slot
+        run: |
+          set -euxo pipefail
+
+          cat > kind-cilium-ipvs.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: k8s-139276-cilium
+          networking:
+            disableDefaultCNI: true
+            kubeProxyMode: "ipvs"
+          kubeadmConfigPatches:
+            - |
+              kind: ClusterConfiguration
+              apiServer:
+                extraArgs:
+                  service-node-port-range: "30000-60999"
+          nodes:
+            - role: control-plane
+          EOF
+
+          kind delete cluster --name k8s-139276-cilium || true
+          kind create cluster --config kind-cilium-ipvs.yaml --image kindest/node:v1.31.0
+
+          kubectl cluster-info
+          kubectl get nodes -o wide || true
+          kubectl -n kube-system get pods -o wide || true
+
+      - name: Install Cilium with NodePort enabled and socket LB disabled
+        run: |
+          set -euxo pipefail
+
+          helm repo add cilium https://helm.cilium.io/
+          helm repo update
+
+          helm upgrade --install cilium cilium/cilium \
+            --version 1.19.4 \
+            --namespace kube-system \
+            --set kubeProxyReplacement=false \
+            --set nodePort.enabled=true \
+            --set socketLB.enabled=false \
+            --set externalIPs.enabled=true \
+            --set hostPort.enabled=true \
+            --set ipam.mode=kubernetes \
+            --set operator.replicas=1 \
+            --set image.pullPolicy=IfNotPresent
+
+          kubectl -n kube-system rollout status ds/cilium --timeout=420s
+          kubectl -n kube-system rollout status deploy/cilium-operator --timeout=420s
+          kubectl -n kube-system rollout status deploy/coredns --timeout=420s
+
+          kubectl get nodes -o wide
+          kubectl -n kube-system get pods -o wide
+
+      - name: Install node debug tools
+        run: |
+          set -euxo pipefail
+          docker exec k8s-139276-cilium-control-plane bash -lc '
+            apt-get update
+            apt-get install -y curl ipvsadm conntrack iptables tcpdump procps iproute2 bpftool
+          '
+
+      - name: Verify Cilium and kube-proxy datapath
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+
+          helm -n kube-system get values cilium > artifacts/cilium-helm-values.txt || true
+          kubectl -n kube-system get cm kube-proxy -o yaml > artifacts/kube-proxy-configmap.yaml || true
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=500 > artifacts/kube-proxy.log || true
+          kubectl -n kube-system logs ds/cilium --tail=500 > artifacts/cilium.log || true
+
+          kubectl -n kube-system exec ds/cilium -- cilium status --verbose > artifacts/cilium-status.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg status --verbose > artifacts/cilium-dbg-status.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg service list > artifacts/cilium-service-list.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg bpf lb list > artifacts/cilium-bpf-lb-list.txt 2>&1 || true
+
+          docker exec k8s-139276-cilium-control-plane bash -lc '
+            set -x
+            ipvsadm -Ln || true
+            iptables-save | grep -E "KUBE|CILIUM|MASQ|random" || true
+            sysctl net.ipv4.ip_local_port_range || true
+            sysctl net.ipv4.ip_local_reserved_ports || true
+            bpftool prog show || true
+            bpftool map show || true
+          ' > artifacts/baseline-node-state.txt 2>&1 || true
+
+      - name: Deploy backend and overlapping NodePorts
+        run: |
+          set -euxo pipefail
+
+          cat > app.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: k8s-139276-echo
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: k8s-139276-echo
+            template:
+              metadata:
+                labels:
+                  app: k8s-139276-echo
+              spec:
+                containers:
+                  - name: agnhost
+                    image: registry.k8s.io/e2e-test-images/agnhost:2.53
+                    args: ["netexec", "--http-port=9397"]
+                    ports:
+                      - containerPort: 9397
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: k8s-139276-clusterip
+          spec:
+            type: ClusterIP
+            selector:
+              app: k8s-139276-echo
+            ports:
+              - name: http
+                port: 9397
+                targetPort: 9397
+          EOF
+
+          kubectl apply -f app.yaml
+          kubectl rollout status deploy/k8s-139276-echo --timeout=180s
+
+          cat > overlap-nodeports.yaml <<'EOF'
+          EOF
+
+          for p in $(seq 32768 32999); do
+            cat >> overlap-nodeports.yaml <<EOF
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: np-overlap-$p
+          spec:
+            type: NodePort
+            selector:
+              app: k8s-139276-echo
+            ports:
+              - name: p$p
+                port: $p
+                targetPort: 9397
+                nodePort: $p
+          EOF
+          done
+
+          kubectl apply -f overlap-nodeports.yaml
+
+          CLUSTER_IP="$(kubectl get svc k8s-139276-clusterip -o jsonpath='{.spec.clusterIP}')"
+          echo "$CLUSTER_IP" | tee cluster-ip.txt
+
+          kubectl get pods -o wide | tee pods.txt
+          kubectl get svc -o wide | tee services.txt
+          kubectl get svc | grep NodePort | wc -l | tee nodeport-count.txt
+
+          docker exec k8s-139276-cilium-control-plane bash -lc "curl -v --max-time 5 http://$CLUSTER_IP:9397/hostname"
+          docker exec k8s-139276-cilium-control-plane bash -lc "ipvsadm -Ln" | tee ipvs-after-services.txt
+
+      - name: Direct source-port collision checks
+        run: |
+          set -euxo pipefail
+
+          CLUSTER_IP="$(cat cluster-ip.txt)"
+
+          run_curl() {
+            label="$1"
+            port="$2"
+
+            echo "=== $label local-port=$port ===" | tee -a direct-collision-results.txt
+
+            set +e
+            docker exec k8s-139276-cilium-control-plane bash -lc "curl -sS --local-port $port --connect-timeout 3 --max-time 6 http://$CLUSTER_IP:9397/hostname" \
+              > "curl-$label.out" 2> "curl-$label.err"
+            rc=$?
+            set -e
+
+            echo "rc=$rc" | tee -a direct-collision-results.txt
+            echo "stdout:" | tee -a direct-collision-results.txt
+            cat "curl-$label.out" | tee -a direct-collision-results.txt || true
+            echo "stderr:" | tee -a direct-collision-results.txt
+            cat "curl-$label.err" | tee -a direct-collision-results.txt || true
+
+            docker exec k8s-139276-cilium-control-plane bash -lc "conntrack -L -p tcp 2>/dev/null | grep -E 'SYN_SENT|UNREPLIED|sport=$port|dport=$port' || true" \
+              | tee -a direct-collision-conntrack.txt
+
+            sleep 3
+          }
+
+          run_curl "collision-nodeport-32770" "32770"
+          run_curl "collision-nodeport-32771" "32771"
+          run_curl "control-no-nodeport-33000" "33000"
+
+      - name: Cilium coexist forced overlap stress
+        run: |
+          set -euxo pipefail
+
+          CLUSTER_IP="$(cat cluster-ip.txt)"
+
+          cat > stress.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -u
+
+          URL="http://__CLUSTER_IP__:9397/hostname"
+
+          sysctl -w net.ipv4.ip_local_port_range="32768 60999"
+          sysctl -w net.ipv4.ip_local_reserved_ports=""
+
+          sysctl net.ipv4.ip_local_port_range
+          sysctl net.ipv4.ip_local_reserved_ports || true
+
+          rm -f /tmp/curl-failures.log /tmp/curl-error-samples.log /tmp/conntrack-overlap.log
+          touch /tmp/curl-failures.log /tmp/curl-error-samples.log /tmp/conntrack-overlap.log
+
+          echo "URL=$URL"
+          date
+
+          seq 1 100000 | xargs -n1 -P300 -I{} bash -c '
+            iter="$1"
+            url="$2"
+            err="/tmp/curl-error-$iter.log"
+
+            if ! curl -sS --connect-timeout 1 --max-time 2 "$url" >/dev/null 2>"$err"; then
+              echo "curl failed iteration=$iter" >> /tmp/curl-failures.log
+
+              sample_count="$(grep -c "^--- iteration=" /tmp/curl-error-samples.log 2>/dev/null || echo 0)"
+              if [ "$sample_count" -lt 100 ]; then
+                {
+                  echo "--- iteration=$iter ---"
+                  cat "$err"
+                } >> /tmp/curl-error-samples.log
+              fi
+            fi
+
+            rm -f "$err"
+          ' _ {} "$URL" || true
+
+          date
+          echo "failure count:"
+          wc -l /tmp/curl-failures.log 2>/dev/null || true
+
+          echo "curl error samples:"
+          cat /tmp/curl-error-samples.log || true
+
+          conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=3276[8-9]|sport=327[7-9][0-9]|sport=328[0-9][0-9]|sport=329[0-9][0-9]" > /tmp/conntrack-overlap.log || true
+
+          echo "relevant conntrack:"
+          cat /tmp/conntrack-overlap.log || true
+          EOF
+
+          sed -i "s|__CLUSTER_IP__|$CLUSTER_IP|g" stress.sh
+
+          docker exec -i k8s-139276-cilium-control-plane bash -s < stress.sh | tee stress-cilium-output.txt
+
+          docker cp k8s-139276-cilium-control-plane:/tmp/curl-failures.log ./curl-failures.log || true
+          docker cp k8s-139276-cilium-control-plane:/tmp/curl-error-samples.log ./curl-error-samples.log || true
+          docker cp k8s-139276-cilium-control-plane:/tmp/conntrack-overlap.log ./conntrack-overlap.log || true
+
+      - name: Final state and verdict
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          kubectl get nodes -o wide > artifacts/nodes.txt || true
+          kubectl get svc -o wide > artifacts/services.txt || true
+          kubectl get endpoints -o wide > artifacts/endpoints.txt || true
+          kubectl get pods -o wide > artifacts/pods.txt || true
+          kubectl -n kube-system get pods -o wide > artifacts/kube-system-pods.txt || true
+          kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=800 > artifacts/kube-proxy.log || true
+          kubectl -n kube-system logs ds/cilium --tail=800 > artifacts/cilium.log || true
+          helm -n kube-system get values cilium > artifacts/cilium-helm-values.txt || true
+
+          kubectl -n kube-system exec ds/cilium -- cilium status --verbose > artifacts/cilium-status.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg status --verbose > artifacts/cilium-dbg-status.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg service list > artifacts/cilium-service-list.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg bpf lb list > artifacts/cilium-bpf-lb-list.txt 2>&1 || true
+          kubectl -n kube-system exec ds/cilium -- cilium-dbg bpf ct list global > artifacts/cilium-bpf-ct-global.txt 2>&1 || true
+
+          docker exec k8s-139276-cilium-control-plane bash -lc '
+            set -x
+            ipvsadm -Ln || true
+            iptables-save | grep -E "KUBE|CILIUM|MASQ|random" || true
+            conntrack -L -p tcp 2>/dev/null | grep -E "SYN_SENT|UNREPLIED|sport=3276[8-9]|sport=327[7-9][0-9]|sport=328[0-9][0-9]|sport=329[0-9][0-9]" || true
+            sysctl net.ipv4.ip_local_port_range || true
+            sysctl net.ipv4.ip_local_reserved_ports || true
+            ps aux | grep kube-apiserver | grep service-node-port-range || true
+            bpftool prog show || true
+            bpftool map show || true
+          ' > artifacts/final-node-state.txt 2>&1 || true
+
+          cp *.txt artifacts/ 2>/dev/null || true
+          cp *.log artifacts/ 2>/dev/null || true
+          cp *.yaml artifacts/ 2>/dev/null || true
+
+          DIRECT_FAILS="$(grep -E "rc=[1-9]" direct-collision-results.txt 2>/dev/null | wc -l || echo 0)"
+          STRESS_FAILS="$(wc -l < curl-failures.log 2>/dev/null || echo 0)"
+          STRESS_CT="$(wc -l < conntrack-overlap.log 2>/dev/null || echo 0)"
+          NODEPORT_COUNT="$(cat nodeport-count.txt 2>/dev/null || echo unknown)"
+
+          {
+            echo "# Kubernetes #139276 Cilium Coexist Repro Summary"
+            echo
+            echo "Topology:"
+            echo "- kind v1.31.0"
+            echo "- kube-proxy mode: IPVS"
+            echo "- Cilium installed as CNI"
+            echo "- Cilium kubeProxyReplacement=false"
+            echo "- Cilium nodePort.enabled=true"
+            echo "- Cilium socketLB.enabled=false"
+            echo "- service-node-port-range=30000-60999"
+            echo "- stress NodePorts=32768-32999"
+            echo "- NodePort count: $NODEPORT_COUNT"
+            echo
+            echo "Direct collision non-zero curl results: $DIRECT_FAILS"
+            echo "Overlap stress curl failures: $STRESS_FAILS"
+            echo "Overlap stress relevant conntrack lines: $STRESS_CT"
+            echo
+            if [ "$STRESS_FAILS" -gt 0 ] && [ "$STRESS_CT" -gt 0 ]; then
+              echo "Verdict: POSSIBLY REPRODUCED"
+              echo "Curl failures occurred and conntrack had SYN_SENT/UNREPLIED or overlap-range evidence. Review artifacts before claiming confirmed reproduction."
+            elif [ "$STRESS_FAILS" -gt 0 ]; then
+              echo "Verdict: INCONCLUSIVE"
+              echo "Curl failures occurred, but conntrack did not clearly show the reported failure mode."
+            else
+              echo "Verdict: NOT REPRODUCED"
+              echo "No curl failures observed under Cilium NodePort + kube-proxy IPVS coexist setup."
+            fi
+          } | tee artifacts/repro-139276-cilium-coexist-summary.md
+
+          kind export logs artifacts/kind-logs --name k8s-139276-cilium || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-139276-cilium-coexist-runtime-repro-logs
+          path: artifacts/
